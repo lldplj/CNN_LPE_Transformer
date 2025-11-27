@@ -1,0 +1,46 @@
+import torch
+import pandas as pd
+
+
+class Config:
+    position = 1  # 例如：1表示第一个/倒数第一个，2表示第二个/倒数第二个
+    ascending = False  # True=保留正序位置，False=保留逆序位置
+
+    input_window = 24
+    predict_steps = 6
+    series_dim = 3
+    series_out = 3
+    train_ratio = 0.8
+
+    feature_size = 128
+    num_heads = 8
+    num_layers = 2
+    dim_feedForward = 512
+    dropout = 0.5
+    grad_clip = 0.4
+
+    batch_size = 32
+    epochs = 100
+    learning_rate = 0.0001
+    patience = 3
+    patience_es = 3
+    huber_delta = 1.0
+    task_weight_temp = 4.0
+
+    noise_injection_prob = 0.3
+    time_interpolation_prob = 0.2
+
+    cos_T0 = 10
+    cos_T_mult = 2
+    patience_lr = 1
+    lr_decay = 0.8
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    inverse_transform = True
+    model_save_path = f'./model/best_model.pth'
+    datafile = './data/train.csv'
+    testfile = './data/test.csv'
+    filename = f'./data/000predictions.xlsx'
+    predictFilename = f'./data/000predict.xlsx'
+    output_columns = pd.read_csv(datafile, nrows=0).columns.tolist()[1:4]
+    input_columns = ['tem', 'heart', 'oxy']
