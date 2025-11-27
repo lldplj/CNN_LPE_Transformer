@@ -1,0 +1,80 @@
+import torch
+import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
+from CNN_LPE_Transformer.model import HuberLoss
+
+
+class Trainer:
+    def __init__(self, model, config, processor):
+        self.model = model
+        self.config = config
+        self.processor = processor
+
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+        self.criterion = HuberLoss(delta=config.huber_delta)
+
+        self.cosine_scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0=config.cos_T0, T_mult=config.cos_T_mult, eta_min=1e-6)
+        self.plateau_scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-7)
+
+        self.best_loss = float('inf')
+        self.no_improve = 0
+
+    def train_epoch(self, train_data, val_data):
+        self.model.train()
+        total_loss = 0
+        tgt_mask = self.model.generate_square_subsequent_mask(self.config.predict_steps)
+
+        for i in range(0, len(train_data), self.config.batch_size):
+            src, tgt_shifted, tgt = self.processor.get_batch(train_data, i)
+            self.optimizer.zero_grad()
+            output = self.model(src, tgt_shifted, tgt_mask=tgt_mask, mode='train')
+
+            losses = []
+            total_weight = 0
+            for idx, col in enumerate(self.config.output_columns):
+                task_loss = self.criterion(output[col]['pred'], tgt[..., idx])
+                weight = output[col]['weight']
+                losses.append(weight * task_loss)
+                total_weight += weight
+
+            loss = sum(losses) / total_weight
+            loss.backward()
+
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            self.optimizer.step()
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(train_data)
+
+        self.cosine_scheduler.step()
+        val_loss, _, _ = self.evaluate(val_data)
+        self.plateau_scheduler.step(val_loss)
+
+        if avg_loss < self.best_loss:
+            self.best_loss = avg_loss
+            self.no_improve = 0
+            torch.save(self.model.state_dict(), self.config.model_save_path)
+        else:
+            self.no_improve += 1
+
+        return avg_loss, val_loss, self.no_improve >= self.config.patience
+
+    def evaluate(self, val_data):
+        self.model.eval()
+        total_loss = 0
+        tgt_mask = self.model.generate_square_subsequent_mask(self.config.predict_steps)
+        with torch.no_grad():
+            for i in range(0, len(val_data), self.config.batch_size):
+                src, tgt_shifted, tgt = self.processor.get_batch(val_data, i)
+                output = self.model(src, tgt_shifted, tgt_mask=tgt_mask, mode='train')
+                losses = []
+                total_weight = 0
+                for idx, col in enumerate(self.config.output_columns):
+                    task_loss = self.criterion(output[col]['pred'], tgt[..., idx])
+                    weight = output[col]['weight']
+                    losses.append(weight * task_loss)
+                    total_weight += weight
+                loss = sum(losses) / total_weight
+                total_loss += loss.item()
+
+        return total_loss / len(val_data), self.no_improve >= self.config.patience, self.no_improve
