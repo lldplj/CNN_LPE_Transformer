@@ -1,0 +1,158 @@
+import torch
+import torch.nn as nn
+
+
+class DoubleResidualCNN(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.in_conv = nn.Conv1d(config.series_dim, 64, kernel_size=3, padding=1)
+
+        self.high_freq_branch = nn.Sequential(
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(128, config.feature_size // 2, kernel_size=3, padding=1)
+        )
+
+        self.mid_period_branch = nn.Sequential(
+            nn.Conv1d(64, 128, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(128, config.feature_size // 2, kernel_size=5, padding=2)
+        )
+
+        self.fusion = nn.Conv1d(config.feature_size, config.feature_size, kernel_size=1)
+
+    def forward(self, x):
+        x = self.in_conv(x)
+        high = self.high_freq_branch(x)
+        mid = self.mid_period_branch(x)
+        fused = torch.cat([high, mid], dim=1)
+        return self.fusion(fused)
+
+
+class LearnablePositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        self.position_emb = nn.Embedding(max_len, d_model)
+
+    def forward(self, x):
+        positions = torch.arange(x.size(0), device=x.device)
+        return x + self.position_emb(positions).unsqueeze(1)
+
+
+class TimeSeriesTransformerCNN(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.cnn = DoubleResidualCNN(config)
+        self.input_emb = nn.Linear(config.feature_size, config.feature_size)
+        self.decoder_input_proj = nn.Linear(
+            len(config.output_columns),
+            config.feature_size
+        )
+        self.pos_encoder = LearnablePositionalEncoding(config.feature_size)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=config.feature_size,
+            num_heads=config.num_heads,
+            dropout=config.dropout,
+            batch_first=False
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.feature_size,
+            nhead=config.num_heads,
+            dim_feedforward=config.dim_feedForward,
+            dropout=config.dropout,
+            batch_first=False
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, config.num_layers)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=config.feature_size,
+            nhead=config.num_heads,
+            dim_feedforward=config.dim_feedForward,
+            dropout=config.dropout,
+            batch_first=False
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, config.num_layers)
+
+        self.output_layers = nn.ModuleDict({
+            col: nn.Linear(config.feature_size, 1) for col in config.output_columns
+        })
+        self.task_weights = nn.Parameter(torch.ones(len(config.output_columns)))
+
+    def _feature_guided_attention(self, Q, K, V):
+        return self.attention(Q, K, V)[0]
+
+    def forward(self, src, tgt, tgt_mask=None, mode='train'):
+        batch_size = src.size(1)
+
+        src_cnn = src.permute(1, 2, 0)
+        src_cnn = self.cnn(src_cnn).permute(2, 0, 1)
+
+        positions = torch.arange(src_cnn.size(0), device=src.device)
+        pos_emb = self.pos_encoder.position_emb(positions).unsqueeze(1)
+        pos_emb = pos_emb.expand(-1, batch_size, -1)
+
+        src_cnn = self.input_emb(src_cnn)
+        attn_output = self._feature_guided_attention(pos_emb, src_cnn, src_cnn)
+
+        memory = self.transformer_encoder(attn_output)
+
+        if mode == 'train':
+            tgt_embedded = self.decoder_input_proj(tgt)  # [pred_steps, batch, 256]
+            output = self.transformer_decoder(tgt_embedded, memory, tgt_mask=tgt_mask)
+        else:
+            current_input = torch.zeros(1, batch_size, len(self.config.output_columns)).to(self.config.device)
+            predictions = []
+            for step in range(self.config.predict_steps):
+                current_input_proj = self.decoder_input_proj(current_input)
+                step_output = self.transformer_decoder(current_input_proj, memory)
+                step_pred = torch.stack([
+                    self.output_layers[col](step_output[-1:]).squeeze(-1)
+                    for col in self.config.output_columns
+                ], dim=-1)  # [1, batch, n_outputs]
+                predictions.append(step_pred.squeeze(0))
+                if step < self.config.predict_steps - 1:
+                    current_input = torch.cat([current_input, step_pred], dim=0)
+            output = torch.stack(predictions, dim=0)  # [pred_steps, batch, n_outputs]
+
+        results = {}
+        if mode == 'train':
+            for idx, col in enumerate(self.config.output_columns):
+                pred = self.output_layers[col](output).squeeze(-1)
+                weight = torch.exp(self.task_weights[idx] / self.config.task_weight_temp)
+                results[col] = {'pred': pred, 'weight': weight}
+        else:
+            for idx, col in enumerate(self.config.output_columns):
+                weight = torch.exp(self.task_weights[idx] / self.config.task_weight_temp)
+                results[col] = {
+                    'pred': torch.stack([p[:, idx] for p in predictions], dim=0),
+                    'weight': weight
+                }
+
+        return results
+
+    def generate_square_subsequent_mask(self, sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, 0.0)
+        return mask.to(self.config.device)
+
+    def unified_predict(self, src):
+        dummy_tgt = torch.zeros(
+            self.config.predict_steps,
+            src.size(1),
+            self.config.feature_size
+        ).to(self.config.device)
+        return self(src, dummy_tgt)
+
+
+class HuberLoss(nn.Module):
+    def __init__(self, delta=1.0):
+        super().__init__()
+        self.delta = delta
+
+    def forward(self, y_pred, y_true):
+        error = y_true - y_pred
+        abs_error = torch.abs(error)
+        quadratic = torch.min(abs_error, self.delta * torch.ones_like(abs_error))
+        linear = abs_error - quadratic
+        return 0.5 * torch.mean(quadratic ** 2) + self.delta * torch.mean(linear)
