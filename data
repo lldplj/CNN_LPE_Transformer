@@ -1,0 +1,62 @@
+import pandas as pd
+import numpy as np
+import torch
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import joblib
+
+
+class DataProcessor:
+    def __init__(self, config):
+        self.config = config
+        self.scaler = StandardScaler()
+        # self.scaler = MinMaxScaler()
+
+    def load_data(self):
+        df = pd.read_csv(self.config.datafile)
+        data = self.scaler.fit_transform(df[self.config.output_columns].values)
+        joblib.dump(self.scaler, self.config.scaler_filename)
+
+        sequences = []
+        for i in range(len(data) - self.config.input_window - self.config.predict_steps + 1):
+            seq = data[i:i + self.config.input_window]
+            label = data[i + self.config.input_window:i + self.config.input_window + self.config.predict_steps]
+            sequences.append((seq, label))
+        return sequences
+
+    def get_batch(self, data, i):
+        batch = data[i:i + self.config.batch_size]
+
+        inputs = np.array([self._augment_data(d[0]) for d in batch])
+        targets = np.array([d[1] for d in batch])
+
+        decoder_inputs = np.zeros_like(targets)  # [batch, predict_steps, features]
+        if len(batch) > 0:
+            decoder_inputs[:, 1:, :] = targets[:, :-1, :]
+
+        inputs = torch.tensor(inputs).float().permute(1, 0, 2).to(self.config.device)
+        targets = torch.tensor(targets).float().permute(1, 0, 2).to(self.config.device)
+        decoder_inputs = torch.tensor(decoder_inputs).float().permute(1, 0, 2).to(self.config.device)
+
+        return inputs, decoder_inputs, targets
+
+    def _augment_data(self, data):
+        if np.random.rand() < self.config.noise_injection_prob:
+            data += np.random.normal(0, 0.01, data.shape)
+
+        if np.random.rand() < self.config.time_interpolation_prob:
+            seq_len = data.shape[0]
+            insert_idx = np.random.randint(1, seq_len - 1)
+            data[insert_idx] = (data[insert_idx - 1] + data[insert_idx]) / 2
+
+        return data
+
+    def load_test_data(self):
+        df = pd.read_csv(self.config.testfile)
+        scaler = joblib.load(self.config.scaler_filename)
+        test_data = scaler.transform(df[self.config.output_columns].values)
+        sequences = []
+        for i in range(len(test_data) - self.config.input_window - self.config.predict_steps + 1):
+            seq = test_data[i:i + self.config.input_window]
+            label = test_data[i + self.config.input_window:i + self.config.input_window + self.config.predict_steps]
+            sequences.append((seq, label))
+        return sequences
