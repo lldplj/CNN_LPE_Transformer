@@ -1,0 +1,37 @@
+import time
+import torch
+from CNN_LPE_Transformer.config import Config
+from CNN_LPE_Transformer.data import DataProcessor
+from CNN_LPE_Transformer.model import TimeSeriesTransformerCNN
+from CNN_LPE_Transformer.train import Trainer
+from CNN_LPE_Transformer.predict import Predictor
+
+
+def main():
+    config = Config()
+    processor = DataProcessor(config)
+
+    data = processor.load_data()
+    train_size = int(config.train_ratio * len(data))
+    train_data, val_data = data[:train_size], data[train_size:]
+
+    model = TimeSeriesTransformerCNN(config).to(config.device)
+    trainer = Trainer(model, config, processor)
+    start_time = time.perf_counter()
+    for epoch in range(config.epochs):
+        train_loss, val_loss, stop = trainer.train_epoch(train_data, val_data)
+        print(f"Epoch {epoch + 1}: Train {train_loss:.5f} | Val {val_loss:.5f}")
+        if stop:
+            print("Early stopping triggered!")
+            break
+
+    print(f"Total time: {time.perf_counter() - start_time:.2f}s")
+
+    test_data = processor.load_test_data()
+    model.load_state_dict(torch.load(config.model_save_path))
+    predictor = Predictor(model, config, processor)
+    predictor.predict_and_plot(test_data)
+
+
+if __name__ == "__main__":
+    main()
