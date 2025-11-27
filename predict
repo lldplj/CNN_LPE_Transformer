@@ -1,0 +1,133 @@
+import torch
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import joblib
+import numpy as np
+import os
+
+class Predictor:
+    def __init__(self, model, config, processor):
+        self.model = model
+        self.config = config
+        self.processor = processor
+
+    def predict_and_plot(self, test_data):
+        self.model.eval()
+        print(f"Loaded model file: {os.path.basename(self.config.model_save_path)}")
+        test_result = {col: [] for col in self.config.output_columns}
+        truth = {col: [] for col in self.config.output_columns}
+        time_indices = []
+        scaler = joblib.load('./model/scaler.pkl')
+
+        with torch.no_grad():
+            for idx, (src_norm, tgt_norm) in enumerate(test_data):
+                src = torch.tensor(src_norm).float().unsqueeze(1).to(self.config.device)
+                memory = self._encode_memory(src)
+                predictions = self._autoregressive_predict(memory, src.size(1))
+                pred_norm = predictions.cpu().numpy()
+                if self.config.inverse_transform:
+                    pred = scaler.inverse_transform(pred_norm.reshape(-1, len(self.config.output_columns)))
+                    true = scaler.inverse_transform(tgt_norm.reshape(-1, len(self.config.output_columns)))
+                else:
+                    pred = pred_norm.reshape(-1, len(self.config.output_columns))
+                    true = tgt_norm.reshape(-1, len(self.config.output_columns))
+                window_start = idx + self.config.input_window
+                current_times = range(window_start, window_start + self.config.predict_steps)
+
+                for step in range(self.config.predict_steps):
+                    time_indices.append(current_times[step])
+                    for col_idx, col in enumerate(self.config.output_columns):
+                        test_result[col].append(pred[step, col_idx])
+                        truth[col].append(true[step, col_idx])
+        df = self._align_predictions(time_indices, truth, test_result)
+        self._plot_results(df)
+        self._calculate_metrics(df)
+        return df
+
+    def _encode_memory(self, src):
+        batch_size = src.size(1)
+        src_cnn = src.permute(1, 2, 0)  # [batch, features, seq_len]
+        src_cnn = self.model.cnn(src_cnn).permute(2, 0, 1)  # [seq_len//2, batch, feature_size]
+        positions = torch.arange(src_cnn.size(0), device=src.device)
+        pos_emb = self.model.pos_encoder.position_emb(positions).unsqueeze(1)
+        pos_emb = pos_emb.expand(-1, batch_size, -1)
+        src_cnn = self.model.input_emb(src_cnn)
+        attn_output = self.model._feature_guided_attention(pos_emb, src_cnn, src_cnn)
+        memory = self.model.transformer_encoder(attn_output)
+        return memory
+
+    def _autoregressive_predict(self, memory, batch_size):
+        decoder_input = torch.zeros(1, batch_size, len(self.config.output_columns)).to(self.config.device)
+        predictions = []
+        for step in range(self.config.predict_steps):
+            current_input_proj = self.model.decoder_input_proj(decoder_input)
+            step_output = self.model.transformer_decoder(current_input_proj, memory)
+            step_pred = torch.stack([
+                self.model.output_layers[col](step_output[-1:]).squeeze(-1)
+                for col in self.config.output_columns
+            ], dim=-1)  # [1, batch, n_outputs]
+            predictions.append(step_pred.squeeze(0))  # [batch, n_outputs]
+            if step < self.config.predict_steps - 1:
+                decoder_input = torch.cat([decoder_input, step_pred], dim=0)
+        return torch.stack(predictions, dim=0)  # [pred_steps, batch, n_outputs]
+
+    def _align_predictions(self, time_indices, truth, test_result):
+        df = pd.DataFrame({
+            'time': time_indices,
+            **{f'{col}_True': truth[col] for col in self.config.output_columns},
+            **{f'{col}_Pred': test_result[col] for col in self.config.output_columns}
+        })
+        df['_rank'] = df.groupby('time').cumcount(ascending=False)
+        df = df[df['_rank'] == (self.config.position - 1)].drop(columns=['_rank'])
+        df = df.sort_values('time')
+        df.to_excel(self.config.result_filename, index=False)
+        df_sampled = df.iloc[::self.config.index_result, :]
+        df_sampled.to_excel(self.config.result_filename.replace('.xlsx', '_sampled.xlsx'), index=False)
+        print(f"Aligned predictions saved to {self.config.result_filename}")
+
+        return df
+
+    def _plot_results(self, df):
+        plt.figure(figsize=(15, 3 * len(self.config.output_columns)))
+        df_sampled = df.iloc[::self.config.index_result, :]
+        sampled_time = df_sampled['time']
+        for idx, col in enumerate(self.config.output_columns, 1):
+            plt.subplot(len(self.config.output_columns), 1, idx)
+            plt.plot(sampled_time, df_sampled[f'{col}_True'], label='True', alpha=0.6, linewidth=1.5)
+            plt.plot(sampled_time, df_sampled[f'{col}_Pred'], label='Predicted', linestyle='--', linewidth=1)
+            plt.title(f"{col} Prediction (pos={self.config.position})")
+            plt.xlabel("Time Step")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(self.config.fig_filename.replace('.xlsx', '.png'), dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"Plot saved to ./result/000predictions_{self.config.index_result}.png")
+
+    def _calculate_metrics(self, df):
+        print("\n" + "=" * 60)
+        print("Test Metrics:")
+        print("=" * 60)
+        metrics_results = []
+        for col in self.config.output_columns:
+            y_true = df[f'{col}_True'].values
+            y_pred = df[f'{col}_Pred'].values
+            mae = mean_absolute_error(y_true, y_pred)
+            mse = mean_squared_error(y_true, y_pred)
+            rmse = np.sqrt(mse)
+            r2 = r2_score(y_true, y_pred)
+            metrics_results.append({
+                'Feature': col,
+                'MAE': f"{mae:.9f}",
+                'MSE': f"{mse:.9f}",
+                'RMSE': f"{rmse:.9f}",
+                'R²': f"{r2:.9f}"
+            })
+            print(f"{col:>15} - MAE: {mae:.9f} | MSE: {mse:.9f} | RMSE: {rmse:.9f} | R²: {r2:.9f}")
+
+        metrics_path = self.config.result_filename.replace('.xlsx', '_metrics.csv')
+        pd.DataFrame(metrics_results).to_csv(metrics_path, index=False)
+        print(f"\nMetrics saved to {metrics_path}")
+        print("=" * 60)
